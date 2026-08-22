@@ -168,6 +168,11 @@ impl TransportEngine {
         media: bool,
     ) -> Result<(TelegramWebSocket, ConnectedRoute), String> {
         let key = DcKey { dc, media };
+        let wait = self.cooldown_wait(key);
+        if wait > Duration::ZERO {
+            tokio::time::sleep(wait).await;
+        }
+
         let candidates = self.ordered_candidates(key);
         let mut errors = Vec::new();
 
@@ -178,7 +183,7 @@ impl TransportEngine {
                     return Ok((websocket, ConnectedRoute { route }));
                 }
                 Err(error) => {
-                    self.record_failure(&route);
+                    self.record_failure(key, &route);
                     errors.push(format!(
                         "{} via {}: {}",
                         route.websocket_host, route.connect_host, error
@@ -193,6 +198,47 @@ impl TransportEngine {
             if media { " media" } else { "" },
             errors.join("; ")
         ))
+    }
+
+    /// How long to wait before any route for this DC becomes eligible again.
+    ///
+    /// Without this pause `ordered_candidates` used to return a route that was
+    /// still in cooldown, each premature attempt wasted four seconds on TCP and
+    /// extended the backoff — the pattern seen in by-sonic/tglock#39.
+    fn cooldown_wait(&self, key: DcKey) -> Duration {
+        let now = Instant::now();
+        let all_routes = self.routes_for_key(key);
+        let health = self.health.lock().unwrap();
+
+        let any_ready = all_routes.iter().any(|route| {
+            health
+                .routes
+                .get(route)
+                .is_none_or(|route_health| route_health.retry_at <= now)
+        });
+        if any_ready {
+            return Duration::ZERO;
+        }
+
+        all_routes
+            .iter()
+            .filter_map(|route| health.routes.get(route))
+            .map(|route_health| route_health.retry_at)
+            .min()
+            .and_then(|retry_at| retry_at.checked_duration_since(now))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Forget a preferred route after it stopped carrying traffic.
+    ///
+    /// The next connect will not spend four seconds on a route that already
+    /// proved dead during the previous tunnel (by-sonic/tglock#32).
+    pub fn demote_preferred_if(&self, dc: u16, media: bool, route: &Route) {
+        let key = DcKey { dc, media };
+        let mut health = self.health.lock().unwrap();
+        if health.preferred.get(&key) == Some(route) {
+            health.preferred.remove(&key);
+        }
     }
 
     fn ordered_candidates(&self, key: DcKey) -> Vec<Route> {
@@ -222,17 +268,6 @@ impl TransportEngine {
             (preferred_rank, kind_rank)
         });
 
-        // If every route is cooling down, retry the one that becomes available first.
-        if candidates.is_empty() {
-            if let Some((route, _)) = health
-                .routes
-                .iter()
-                .filter(|(route, _)| all_routes.contains(route))
-                .min_by_key(|(_, route_health)| route_health.retry_at)
-            {
-                candidates.push(route.clone());
-            }
-        }
         candidates
     }
 
@@ -272,9 +307,12 @@ impl TransportEngine {
         self.route_failures.load(Ordering::Relaxed)
     }
 
-    fn record_failure(&self, route: &Route) {
+    fn record_failure(&self, key: DcKey, route: &Route) {
         self.route_failures.fetch_add(1, Ordering::Relaxed);
         let mut health = self.health.lock().unwrap();
+        if health.preferred.get(&key) == Some(route) {
+            health.preferred.remove(&key);
+        }
         let failures = health
             .routes
             .get(route)
@@ -468,6 +506,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_preferred_route_is_demoted() {
+        let engine = TransportEngine::new();
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        let routes = routes_for_dc(2, false);
+        engine.record_success(key, &routes[0]);
+        engine.record_failure(key, &routes[0]);
+        assert!(
+            engine.health.lock().unwrap().preferred.get(&key).is_none(),
+            "a failed preferred route must not block the next cascade"
+        );
+    }
+
+    #[test]
     fn failed_route_enters_cooldown() {
         let engine = TransportEngine::new();
         let key = DcKey {
@@ -475,7 +529,7 @@ mod tests {
             media: false,
         };
         let failed = routes_for_dc(2, false)[0].clone();
-        engine.record_failure(&failed);
+        engine.record_failure(key, &failed);
         assert!(!engine.ordered_candidates(key).contains(&failed));
     }
 
@@ -547,7 +601,7 @@ mod tests {
         for (index, expected) in expected_seconds.iter().enumerate() {
             let attempt = u32::try_from(index).unwrap() + 1;
             let before = Instant::now();
-            engine.record_failure(&route);
+            engine.record_failure(DcKey { dc: 2, media: false }, &route);
 
             let health = engine.health.lock().unwrap();
             let entry = health.routes.get(&route).unwrap();
@@ -574,8 +628,8 @@ mod tests {
         };
         let route = routes_for_dc(2, false)[0].clone();
 
-        engine.record_failure(&route);
-        engine.record_failure(&route);
+        engine.record_failure(key, &route);
+        engine.record_failure(key, &route);
         assert!(!engine.ordered_candidates(key).contains(&route));
 
         engine.record_success(key, &route);
@@ -584,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn all_routes_cooling_down_still_yields_the_soonest_retry() {
+    fn all_routes_cooling_down_waits_before_retry() {
         let engine = TransportEngine::new();
         let key = DcKey {
             dc: 5,
@@ -594,19 +648,17 @@ mod tests {
 
         // Fail the first route once and the rest twice, so the first one is the
         // one that becomes available again soonest.
-        engine.record_failure(&routes[0]);
+        engine.record_failure(key, &routes[0]);
         for route in &routes[1..] {
-            engine.record_failure(route);
-            engine.record_failure(route);
+            engine.record_failure(key, route);
+            engine.record_failure(key, route);
         }
 
         let candidates = engine.ordered_candidates(key);
-        assert_eq!(
-            candidates.len(),
-            1,
-            "a fully cooling table must offer exactly one retry, not give up"
+        assert!(
+            candidates.is_empty(),
+            "routes still in cooldown must not be offered prematurely"
         );
-        assert_eq!(candidates[0], routes[0]);
     }
 
     #[test]
@@ -680,11 +732,29 @@ mod tests {
         let routes = routes_for_dc(2, false);
         assert_eq!(engine.route_failures(), 0);
 
-        engine.record_failure(&routes[0]);
+        engine.record_failure(
+            DcKey {
+                dc: 2,
+                media: false,
+            },
+            &routes[0],
+        );
         assert_eq!(engine.route_failures(), 1);
 
-        engine.record_failure(&routes[0]);
-        engine.record_failure(&routes[1]);
+        engine.record_failure(
+            DcKey {
+                dc: 2,
+                media: false,
+            },
+            &routes[0],
+        );
+        engine.record_failure(
+            DcKey {
+                dc: 2,
+                media: false,
+            },
+            &routes[1],
+        );
         assert_eq!(
             engine.route_failures(),
             3,

@@ -664,6 +664,7 @@ async fn ws_tunnel(
     use futures_util::{SinkExt, StreamExt};
 
     let (mut ws, connected) = stats.transport.connect(dc, media).await?;
+    let route = connected.route.clone();
     let _tunnel = EstablishedTunnel::new(stats);
     stats.note_tunnel(dc, connected.route.kind.ui_code());
 
@@ -673,6 +674,7 @@ async fn ws_tunnel(
     ws.send(tungstenite::Message::Binary(init.to_vec())).await?;
 
     let mut buf = vec![0u8; 65536];
+    let mut route_failed = false;
 
     loop {
         tokio::select! {
@@ -690,12 +692,19 @@ async fn ws_tunnel(
                     let _ = ws.send(tungstenite::Message::Pong(p)).await;
                 }
                 Some(Ok(tungstenite::Message::Close(_))) | None => break,
-                Some(Err(_)) => break,
+                Some(Err(_)) => {
+                    route_failed = true;
+                    break;
+                }
                 _ => {}
             },
 
             n = tcp_r.read(&mut buf) => match n {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    route_failed = true;
+                    break;
+                }
                 Ok(n) => {
                     if let Some(crypto) = &mut crypto {
                         crypto.client_to_telegram(&mut buf[..n]);
@@ -704,6 +713,10 @@ async fn ws_tunnel(
                 }
             },
         }
+    }
+
+    if route_failed {
+        stats.transport.demote_preferred_if(dc, media, &route);
     }
 
     let _ = ws.close(None).await;
